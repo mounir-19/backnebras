@@ -111,16 +111,42 @@ exports.createAppointment = asyncHandler(async (req, res) => {
     }
   }
 
-  const availability = buildAvailabilityForDate({
-    slots: doctorTimeSlots,
-    appointments: doctorAppointments,
-    date: appointmentDate
-  });
+  // ============================================
+  // Check slot exists and is not blocked
+  // Use appointments list (not isBooked flag) to determine availability
+  // isBooked flag can be stale; appointments are the source of truth
+  // ============================================
+  const slotExists = doctorTimeSlots.find(slot => normalizeTimeOnly(slot.startTime) === requestedTime);
 
-  const requestedSlot = availability.slots.find(slot => normalizeTimeOnly(slot.startTime) === requestedTime);
+  console.log('requestedTime:', requestedTime);
+  console.log('doctorTimeSlots:', doctorTimeSlots.map(s => ({
+    startTime: s.startTime,
+    isBlocked: s.isBlocked,
+    isBooked: s.isBooked,
+    specificDate: s.specificDate,
+    dayOfWeek: s.dayOfWeek
+  })));
+  console.log('doctorAppointments:', doctorAppointments.map(a => ({
+    time: a.appointmentTime,
+    status: a.status
+  })));
 
-  if (!requestedSlot || !requestedSlot.selectable) {
+  if (!slotExists) {
     return res.status(400).json({ error: 'Selected time is not available' });
+  }
+
+  if (slotExists.isBlocked) {
+    return res.status(400).json({ error: 'Selected time is blocked by the doctor' });
+  }
+
+  // Check if there's already a confirmed/pending/completed appointment at this time
+  const conflictingAppointment = doctorAppointments.find(apt =>
+    normalizeTimeOnly(apt.appointmentTime) === requestedTime &&
+    ['confirmed', 'completed'].includes(apt.status)
+  );
+
+  if (conflictingAppointment) {
+    return res.status(400).json({ error: 'Selected time is already booked' });
   }
 
   const appointment = await prisma.appointment.create({
@@ -176,14 +202,11 @@ exports.getMyAppointments = asyncHandler(async (req, res) => {
   let whereClause = {};
 
   if (userType === 'patient') {
-    // Patient sees their appointments
     whereClause.patientId = userId;
   } else if (userType === 'psychologue' || userType === 'counselor') {
-    // Doctor sees their appointments
     whereClause.doctorId = userId;
   }
 
-  // Filter by status if provided
   if (status) {
     whereClause.status = status;
   }
@@ -250,7 +273,6 @@ exports.getMyAppointments = asyncHandler(async (req, res) => {
     orderBy: { appointmentDate: 'asc' }
   });
 
-  // Format response
   const formatted = appointments.map(apt => ({
     id: apt.id,
     appointmentDate: apt.appointmentDate,
@@ -281,7 +303,6 @@ exports.getMyAppointments = asyncHandler(async (req, res) => {
 exports.getAppointmentById = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const userId = req.user.id;
-  const userType = req.user.userType;
 
   const appointment = await prisma.appointment.findUnique({
     where: { id },
@@ -295,7 +316,6 @@ exports.getAppointmentById = asyncHandler(async (req, res) => {
     return res.status(404).json({ error: 'Appointment not found' });
   }
 
-  // Check if user is part of this appointment
   if (appointment.patientId !== userId && appointment.doctorId !== userId) {
     return res.status(403).json({ error: 'Not authorized to view this appointment' });
   }
@@ -312,19 +332,16 @@ exports.updateAppointmentStatus = asyncHandler(async (req, res) => {
   const { status, notes } = req.body;
   const userId = req.user.id;
 
-  // Find appointment
   const appointment = await prisma.appointment.findUnique({ where: { id } });
 
   if (!appointment) {
     return res.status(404).json({ error: 'Appointment not found' });
   }
 
-  // Only doctor can update status
   if (appointment.doctorId !== userId) {
     return res.status(403).json({ error: 'Only the doctor can update this appointment' });
   }
 
-  // Validate status
   const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled'];
   if (!validStatuses.includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
@@ -332,7 +349,6 @@ exports.updateAppointmentStatus = asyncHandler(async (req, res) => {
 
   const previousStatus = appointment.status;
 
-  // Update appointment (minimal select, no includes)
   const updated = await prisma.appointment.update({
     where: { id },
     data: {
@@ -341,7 +357,6 @@ exports.updateAppointmentStatus = asyncHandler(async (req, res) => {
     }
   });
 
-  // Update denormalized counters when appointment is completed
   if (status === 'completed' && previousStatus !== 'completed') {
     await prisma.profile.update({
       where: { userId: appointment.doctorId },
@@ -356,7 +371,6 @@ exports.updateAppointmentStatus = asyncHandler(async (req, res) => {
     });
   }
 
-  // If confirmed, mark the time slot as booked
   if (status === 'confirmed') {
     const appointmentDate = new Date(updated.appointmentDate);
     const dayOfWeek = appointmentDate.getDay();
@@ -380,7 +394,6 @@ exports.updateAppointmentStatus = asyncHandler(async (req, res) => {
     }
   }
 
-  // If cancelled, free up the time slot
   if (status === 'cancelled') {
     const dayOfWeek = new Date(appointment.appointmentDate).getDay();
     await prisma.timeSlot.updateMany({
@@ -394,7 +407,6 @@ exports.updateAppointmentStatus = asyncHandler(async (req, res) => {
     });
   }
 
-  // Fetch updated appointment without heavy includes for response
   const responseAppointment = await prisma.appointment.findUnique({
     where: { id },
     include: {
@@ -422,18 +434,15 @@ exports.cancelAppointment = asyncHandler(async (req, res) => {
     return res.status(404).json({ error: 'Appointment not found' });
   }
 
-  // Only patient or doctor can cancel
   if (appointment.patientId !== userId && appointment.doctorId !== userId) {
     return res.status(403).json({ error: 'Not authorized' });
   }
 
-  // Update status
   const updated = await prisma.appointment.update({
     where: { id },
     data: { status: 'cancelled' }
   });
 
-  // Free up time slot
   const dayOfWeek = new Date(appointment.appointmentDate).getDay();
   await prisma.timeSlot.updateMany({
     where: {
@@ -450,9 +459,6 @@ exports.cancelAppointment = asyncHandler(async (req, res) => {
 });
 
 // ============================================
-// URGENT REQUESTS
-// ============================================
-// ============================================
 // CREATE URGENT REQUEST (Patient)
 // ============================================
 exports.createUrgentRequest = asyncHandler(async (req, res) => {
@@ -461,7 +467,6 @@ exports.createUrgentRequest = asyncHandler(async (req, res) => {
 
   console.log('Creating urgent request:', { patientId, doctorId, notes, appointmentTime });
 
-  // Find an available doctor if none specified
   let selectedDoctorId = doctorId;
   if (!selectedDoctorId) {
     const availableDoctor = await prisma.user.findFirst({
@@ -480,13 +485,11 @@ exports.createUrgentRequest = asyncHandler(async (req, res) => {
     }
   }
 
-  // Default time = now if not provided
   const now = new Date();
-  const defaultTime = now.toTimeString().slice(0, 5); // "HH:MM"
+  const defaultTime = now.toTimeString().slice(0, 5);
 
   console.log('Creating with doctorId:', selectedDoctorId, 'time:', appointmentTime || defaultTime);
 
-  // Create urgent request with VIP priority
   const urgentRequest = await prisma.urgentRequest.create({
     data: {
       patientId,
@@ -504,7 +507,6 @@ exports.createUrgentRequest = asyncHandler(async (req, res) => {
 
   console.log('Urgent request created:', urgentRequest.id);
 
-  // Emit socket event to notify the doctor/counselor about the new urgent request
   if (global.io) {
     global.io.to(`user:${selectedDoctorId}`).emit('urgentRequestCreated', {
       id: urgentRequest.id,
@@ -525,7 +527,7 @@ exports.createUrgentRequest = asyncHandler(async (req, res) => {
 });
 
 // ============================================
-// GET URGENT REQUESTS (Patient or Doctor) - Excludes expired (1 hour)
+// GET URGENT REQUESTS (Patient or Doctor)
 // ============================================
 exports.getUrgentRequests = asyncHandler(async (req, res) => {
   const userId = req.user.id;
@@ -540,7 +542,6 @@ exports.getUrgentRequests = asyncHandler(async (req, res) => {
     whereClause.doctorId = userId;
   }
 
-  // Only return non-expired requests (within 1 hour)
   whereClause.createdAt = { gte: oneHourAgo };
 
   const urgentRequests = await prisma.urgentRequest.findMany({
@@ -563,7 +564,6 @@ exports.acceptUrgentRequest = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const doctorId = req.user.id;
 
-  // Check if request is already handled
   const existingCall = await prisma.urgentRequest.findFirst({
     where: {
       id,
@@ -588,7 +588,6 @@ exports.acceptUrgentRequest = asyncHandler(async (req, res) => {
     }
   });
 
-  // Cancel all other pending urgent requests for this patient
   await prisma.urgentRequest.updateMany({
     where: {
       patientId: urgentRequest.patientId,
@@ -598,7 +597,6 @@ exports.acceptUrgentRequest = asyncHandler(async (req, res) => {
     data: { status: 'rejected' }
   });
 
-  // Notify other doctors their request was cancelled
   if (global.io) {
     const cancelledRequests = await prisma.urgentRequest.findMany({
       where: {
@@ -618,7 +616,6 @@ exports.acceptUrgentRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Create appointment with in_call status for immediate video call
   const appointmentDate = urgentRequest.appointmentDate || new Date();
   const appointmentTime = urgentRequest.appointmentTime || new Date().toTimeString().slice(0, 5);
 
@@ -634,7 +631,6 @@ exports.acceptUrgentRequest = asyncHandler(async (req, res) => {
     }
   });
 
-  // Notify patient that their urgent request was accepted
   if (global.io) {
     global.io.to(`user:${urgentRequest.patientId}`).emit('callAccepted', {
       urgentId: id,
@@ -652,7 +648,6 @@ exports.acceptUrgentRequest = asyncHandler(async (req, res) => {
     startCall: true
   });
 });
-
 
 // ============================================
 // REJECT URGENT REQUEST (Doctor)
@@ -673,7 +668,6 @@ exports.rejectUrgentRequest = asyncHandler(async (req, res) => {
     }
   });
 
-  // Notify patient that their urgent request was rejected
   if (global.io) {
     global.io.to(`user:${urgentRequest.patientId}`).emit('callRejected', {
       urgentId: id,
@@ -689,9 +683,6 @@ exports.rejectUrgentRequest = asyncHandler(async (req, res) => {
 
 });
 
-// ============================================
-// COMPLETE URGENT REQUEST (Doctor)
-// ============================================
 // ============================================
 // GET URGENT ACCESS STATUS (Patient)
 // ============================================
@@ -715,6 +706,10 @@ exports.getUrgentAccessStatus = asyncHandler(async (req, res) => {
   });
 
 });
+
+// ============================================
+// GET APPOINTMENT VIP ANSWERS
+// ============================================
 exports.getAppointmentAnswers = asyncHandler(async (req, res) => {
   const { id } = req.params;
   console.log('=== GET ANSWERS for appointment:', id);
@@ -724,8 +719,9 @@ exports.getAppointmentAnswers = asyncHandler(async (req, res) => {
   console.log('=== FOUND RESPONSE:', response ? 'YES' : 'NO');
   res.json({ answers: response ? JSON.parse(response.answers) : [] });
 });
+
 // ============================================
-// ACTIVATE URGENT ACCESS (30 days) - After payment
+// ACTIVATE URGENT ACCESS (30 days)
 // ============================================
 exports.activateUrgentAccess = asyncHandler(async (req, res) => {
   const userId = req.user.id;
@@ -744,7 +740,7 @@ exports.activateUrgentAccess = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    message: 'URGENT access activated for 7 days',
+    message: 'URGENT access activated for 30 days',
     startDate: user.urgentAccessStart,
     expiryDate: user.urgentAccessExpiry
   });
@@ -768,7 +764,6 @@ exports.startCallState = asyncHandler(async (req, res) => {
     select: { id: true, fullname: true, currentCallId: true, currentCallPartnerId: true }
   });
 
-  // Also update patient to know they're in call
   if (patientId) {
     await prisma.user.update({
       where: { id: patientId },
@@ -780,7 +775,6 @@ exports.startCallState = asyncHandler(async (req, res) => {
     });
   }
 
-  // Emit real-time event to patient
   if (global.io && patientId) {
     global.io.to(`patient:${patientId}`).emit('session-started', {
       appointmentId: appointmentId,
@@ -809,7 +803,6 @@ exports.endCallState = asyncHandler(async (req, res) => {
   const previousCallId = user?.currentCallId;
   const previousPartnerId = user?.currentCallPartnerId;
 
-  // Clear doctor's state
   await prisma.user.update({
     where: { id: userId },
     data: {
@@ -819,7 +812,6 @@ exports.endCallState = asyncHandler(async (req, res) => {
     }
   });
 
-  // Mark appointment as completed
   if (previousCallId) {
     try {
       await prisma.appointment.update({
@@ -831,7 +823,6 @@ exports.endCallState = asyncHandler(async (req, res) => {
     }
   }
 
-  // Clear patient's state if doctor ended
   if (userType === 'psychologue' || userType === 'counselor') {
     if (previousPartnerId) {
       await prisma.user.update({
@@ -861,6 +852,7 @@ exports.endCallState = asyncHandler(async (req, res) => {
 
   res.json({ success: true, message: 'Call state ended' });
 });
+
 // ============================================
 // GET MY CALL STATUS (Patient or Doctor)
 // ============================================

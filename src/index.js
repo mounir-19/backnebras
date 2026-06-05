@@ -31,24 +31,27 @@ const server = http.createServer(app);
 // CORS — applied at every possible layer
 // ============================================
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Vary', 'Origin');
   next();
 });
 
 app.options('*', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.status(204).end();
 });
 
 const io = new Server(server, {
-    cors: { origin: '*', methods: ['GET', 'POST'] }
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
 });
 
 io.use((socket, next) => {
@@ -90,7 +93,7 @@ app.use(express.static(path.join(__dirname, '../../Frontend')));
 
 // Home route - Test if server is running
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     message: 'Nebras API is running!',
     version: '1.0.0',
     endpoints: {
@@ -120,13 +123,13 @@ app.get('/api/settings', adminController.getSettings);
 // ============================================
 
 io.on('connection', (socket) => {
-    console.log(`Client connected: ${socket.id}`);
+  console.log(`Client connected: ${socket.id}`);
 
   if (socket.user?.id) {
     socket.join(`user:${socket.user.id}`);
   }
 
-  socket.on('message:send', async (payload = {}, callback = () => {}) => {
+  socket.on('message:send', async (payload = {}, callback = () => { }) => {
     try {
       const senderId = socket.user?.id;
       const { receiverId, content } = payload;
@@ -158,23 +161,23 @@ io.on('connection', (socket) => {
       callback({ error: 'Failed to send message' });
     }
   });
-    
-    // Join a room to receive session notifications for a specific patient
-    socket.on('join-patient-room', (patientId) => {
-        socket.join(`patient:${patientId}`);
-        console.log(`Socket ${socket.id} joined patient room: patient:${patientId}`);
-    });
-    
-    // Join a room to receive session notifications for a specific doctor
-    socket.on('join-doctor-room', (doctorId) => {
-        socket.join(`doctor:${doctorId}`);
-        console.log(`Socket ${socket.id} joined doctor room: doctor:${doctorId}`);
-    });
-    
-    // Leave rooms on disconnect
-    socket.on('disconnect', () => {
-        console.log(`Client disconnected: ${socket.id}`);
-    });
+
+  // Join a room to receive session notifications for a specific patient
+  socket.on('join-patient-room', (patientId) => {
+    socket.join(`patient:${patientId}`);
+    console.log(`Socket ${socket.id} joined patient room: patient:${patientId}`);
+  });
+
+  // Join a room to receive session notifications for a specific doctor
+  socket.on('join-doctor-room', (doctorId) => {
+    socket.join(`doctor:${doctorId}`);
+    console.log(`Socket ${socket.id} joined doctor room: doctor:${doctorId}`);
+  });
+
+  // Leave rooms on disconnect
+  socket.on('disconnect', () => {
+    console.log(`Client disconnected: ${socket.id}`);
+  });
 });
 
 // ============================================
